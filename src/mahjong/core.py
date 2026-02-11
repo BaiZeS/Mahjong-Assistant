@@ -41,15 +41,16 @@ class LayoutEstimator:
         if roi.size == 0:
             return []
             
-        # 1. 图像预处理：灰度化
+        # 1. 图像预处理：灰度化 + 高斯模糊
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        # 高斯模糊有助于去除由于视频压缩或桌布纹理产生的高频噪声
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
         
         # 2. 自适应二值化
-        # 使用 cv2.adaptiveThreshold 适应局部光照
-        # 注意：通常麻将牌是白色的，背景是深色的。为了提取牌的轮廓，我们需要前景为白色（255）。
-        # 因此使用 cv2.THRESH_BINARY。如果使用 INV，则会提取背景或文字。
+        # 增大 blockSize (11 -> 29) 以适应麻将牌较大的平坦区域
+        # 增大 C (2 -> 5) 以增强对背景噪声的过滤能力
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                     cv2.THRESH_BINARY, 11, 2)
+                                     cv2.THRESH_BINARY, 29, 5)
         
         # 3. 形态学操作（核心）
         # MORPH_OPEN：先腐蚀再膨胀，断开麻将牌之间的连接，去除小噪点
@@ -88,7 +89,27 @@ class LayoutEstimator:
                 
             potential_regions.append((x + rx, y + ry, rw, rh))
             
-        # 6. 排序与输出
+        # 6. 基于统计的二次过滤 (Robustness)
+        # 如果找到的轮廓数量足够，使用中位数宽高剔除异常值（如UI按钮、特效）
+        if len(potential_regions) >= 4:
+            widths = [r[2] for r in potential_regions]
+            heights = [r[3] for r in potential_regions]
+            median_w = np.median(widths)
+            median_h = np.median(heights)
+            
+            filtered_regions = []
+            for r in potential_regions:
+                rx, ry, rw, rh = r
+                # 宽度一致性检查 (允许 +/- 35% 误差)
+                if not (0.65 * median_w < rw < 1.35 * median_w):
+                    continue
+                # 高度一致性检查 (允许 +/- 40% 误差，选中牌可能会浮起)
+                if not (0.6 * median_h < rh < 1.4 * median_h):
+                    continue
+                filtered_regions.append(r)
+            potential_regions = filtered_regions
+
+        # 7. 排序与输出
         potential_regions.sort(key=lambda r: r[0])
         
         # 简单的重叠去除 (NMS-like)
