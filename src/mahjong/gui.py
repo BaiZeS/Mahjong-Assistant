@@ -16,6 +16,51 @@ from .capture import WindowDetector, ScreenCapture, WindowInfo
 from .recognition import TileRecognizer
 from .core import LayoutEstimator, GameStateExtractor
 from .client import BackendClient
+from .manager import BackendManager
+
+class CaptureThread(QtCore.QThread):
+    result_ready = QtCore.pyqtSignal(dict, object)  # combined_result, image
+    error_occurred = QtCore.pyqtSignal(str)
+
+    def __init__(self, window_info: WindowInfo, capture: ScreenCapture, 
+                 extractor: GameStateExtractor, backend_client: BackendClient) -> None:
+        super().__init__()
+        self.window_info = window_info
+        self.capture = capture
+        self.extractor = extractor
+        self.backend_client = backend_client
+        self.running = True
+
+    def run(self) -> None:
+        while self.running:
+            try:
+                if not win32gui.IsWindow(self.window_info.handle):
+                    self.error_occurred.emit("窗口无效")
+                    self.msleep(1000)
+                    continue
+
+                image = self.capture.capture(self.window_info)
+                if image is None:
+                    self.msleep(200)
+                    continue
+
+                state = self.extractor.extract(image)
+                result = self.backend_client.predict(state)
+                
+                combined = {
+                    "state": state,
+                    "prediction": result
+                }
+                
+                self.result_ready.emit(combined, image)
+                self.msleep(800) # Process every ~800ms
+            except Exception as e:
+                self.error_occurred.emit(str(e))
+                self.msleep(1000)
+
+    def stop(self) -> None:
+        self.running = False
+        self.wait()
 
 class AnnotateLabel(QtWidgets.QLabel):
     def __init__(self, orig_w: int, orig_h: int, pix: QtGui.QPixmap) -> None:
@@ -78,45 +123,6 @@ class AnnotateDialog(QtWidgets.QDialog):
         return self.label.selected_rect_original()
 
 
-class BackendManager:
-    def __init__(self, port: int = 8765) -> None:
-        self.port = port
-        self.process: Optional[subprocess.Popen] = None
-        self.logger = logging.getLogger("mahjong.backend_manager")
-
-    def start(self) -> None:
-        if self.process and self.process.poll() is None:
-            return
-            
-        self.process = subprocess.Popen(
-            [sys.executable, "-m", "src.mahjong.backend", "--port", str(self.port)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            cwd=os.getcwd()
-        )
-        self.logger.info("Backend started with PID %s", self.process.pid)
-
-    def stop(self) -> None:
-        if self.process:
-            pid = self.process.pid
-            self.logger.info("Stopping backend PID %s", pid)
-            if self.process.poll() is None:
-                self.process.terminate()
-                try:
-                    self.process.wait(timeout=1)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                
-                if os.name == 'nt':
-                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(pid)], 
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.process = None
-            self.logger.info("Backend stopped")
-
-    def is_running(self) -> bool:
-        return self.process is not None and self.process.poll() is None
-
-
 class MainWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -161,8 +167,9 @@ class MainWindow(QtWidgets.QWidget):
             app.aboutToQuit.connect(self.backend_manager.stop)
 
         self.backend_client = BackendClient(f"http://127.0.0.1:{self.backend_port}")
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.process_frame)
+        # Threading for capture loop
+        self.thread: Optional[CaptureThread] = None
+        
         self.current_window: Optional[WindowInfo] = None
         self._build_ui()
         self.refresh_windows()
@@ -179,12 +186,11 @@ class MainWindow(QtWidgets.QWidget):
         self.status_label = QtWidgets.QLabel("状态：未开始")
         self.status_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.preview_label = QtWidgets.QLabel()
-        # Set fixed width 600, allow height to expand but keep aspect ratio via scaling
-        self.preview_label.setFixedWidth(600)
-        self.preview_label.setMinimumHeight(338) # Approx 16:9 for 600 width
+        # Allow resizing down to a small size
+        self.preview_label.setMinimumSize(320, 180) 
         self.preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setScaledContents(False)
-        self.preview_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.MinimumExpanding)
+        self.preview_label.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored, QtWidgets.QSizePolicy.Policy.MinimumExpanding)
         preview_container.addWidget(self.status_label)
         preview_container.addWidget(self.preview_label)
         main_layout.addLayout(preview_container)
@@ -297,6 +303,18 @@ class MainWindow(QtWidgets.QWidget):
         hand_layout.addWidget(self.hand_label)
         info_layout.addWidget(hand_group)
         
+        # Discard Group (Opponents)
+        discard_group = QtWidgets.QGroupBox("对手出牌")
+        discard_layout = QtWidgets.QFormLayout(discard_group)
+        discard_layout.setContentsMargins(10, 10, 10, 10)
+        self.discard_labels = {}
+        for pid, name in [(1, "对家"), (2, "上家"), (3, "下家")]:
+            lbl = QtWidgets.QLabel("等待识别...")
+            lbl.setWordWrap(True)
+            self.discard_labels[pid] = lbl
+            discard_layout.addRow(f"{name}:", lbl)
+        info_layout.addWidget(discard_group)
+        
         # Action Group
         action_group = QtWidgets.QGroupBox("操作建议")
         action_layout = QtWidgets.QVBoxLayout(action_group)
@@ -321,6 +339,10 @@ class MainWindow(QtWidgets.QWidget):
         self.discard_label.setVisible(False)
         
         main_layout.addLayout(bottom_panel)
+        
+        # Set the window to the smallest possible size
+        self.adjustSize()
+        self.resize(self.minimumSizeHint())
         
         # Connect signals
         self.refresh_button.clicked.connect(self.refresh_windows)
@@ -367,6 +389,11 @@ class MainWindow(QtWidgets.QWidget):
             self.status_label.setText("状态：模板未加载")
             self.logger.warning("Templates not loaded")
             return
+        
+        # Prevent starting multiple threads
+        if self.thread and self.thread.isRunning():
+            return
+            
         try:
             if not win32gui.IsWindow(data.handle):
                 self.status_label.setText("状态：窗口无效")
@@ -378,12 +405,27 @@ class MainWindow(QtWidgets.QWidget):
                 self.logger.info("Restarted backend process")
                 
             self.current_window = data
+            
+            # Initial test capture
             test_image = self.capture.capture(self.current_window)
             if test_image is None:
                 self.status_label.setText("状态：无法捕获窗口")
                 return
+            
             self._update_settings()
-            self.timer.start(800)
+            self.extractor.reset()
+            
+            # Start Thread
+            self.thread = CaptureThread(
+                self.current_window, 
+                self.capture, 
+                self.extractor, 
+                self.backend_client
+            )
+            self.thread.result_ready.connect(self.on_frame_processed)
+            self.thread.error_occurred.connect(self.on_thread_error)
+            self.thread.start()
+            
             self.status_label.setText("状态：识别中")
             self.logger.info("Start capture: %s (%s)", data.title, data.handle)
         except Exception as exc:
@@ -391,7 +433,9 @@ class MainWindow(QtWidgets.QWidget):
             self.logger.exception("Start failed: %s", exc)
 
     def stop(self) -> None:
-        self.timer.stop()
+        if self.thread:
+            self.thread.stop()
+            self.thread = None
         self.backend_manager.stop()
         self.status_label.setText("状态：已停止")
         self.logger.info("Stop capture")
@@ -399,9 +443,68 @@ class MainWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
         self.logger.info("Window close event triggered")
-        self.timer.stop()
+        if self.thread:
+            self.thread.stop()
         self.backend_manager.stop()
         event.accept()
+
+    def on_thread_error(self, msg: str) -> None:
+        self.status_label.setText(f"状态：识别异常 {msg}")
+
+    def on_frame_processed(self, combined: dict, image: np.ndarray) -> None:
+        try:
+            state = combined.get("state", {})
+            result = combined.get("prediction", {})
+            
+            # Debug Drawing
+            debug_img = image.copy()
+            layout_dict = state.get("layout")
+            if layout_dict:
+                # Draw hand regions
+                hand_regions = layout_dict.get("hand_regions", [])
+                for i, (x, y, w, h) in enumerate(hand_regions):
+                    cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    # If we have recognition result for this tile, draw it
+                    hand_tiles = state.get("hand", [])
+                    if i < len(hand_tiles):
+                        name = tile_to_name(hand_tiles[i])
+                        cv2.putText(debug_img, name, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            preview = cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB)
+            preview = np.ascontiguousarray(preview)
+            height, width = preview.shape[:2]
+            bytes_per_line = preview.strides[0]
+            qimg = QtGui.QImage(
+                preview.data,
+                width,
+                height,
+                bytes_per_line,
+                QtGui.QImage.Format.Format_RGB888,
+            ).copy()
+            pix = QtGui.QPixmap.fromImage(qimg)
+            target_size = self.preview_label.size()
+            if target_size.width() > 0 and target_size.height() > 0:
+                pix = pix.scaled(
+                    target_size,
+                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                    QtCore.Qt.TransformationMode.SmoothTransformation,
+                )
+            self.preview_label.setPixmap(pix)
+            
+            recommendations = result.get("recommendations", [])
+            warning = result.get("warning", "")
+            action = result.get("action_advice", {})
+            discards = result.get("discard_suggestions", [])
+            if warning:
+                self.status_label.setText(f"状态：{warning}")
+            else:
+                self.status_label.setText("状态：识别中")
+            self._render_state(state)
+            self._render_action(action, discards)
+            self._render_recommendations(recommendations, warning)
+        except Exception as exc:
+            # If rendering fails, we don't stop the thread, just log
+            self.logger.exception("Render frame failed: %s", exc)
 
     def _capture_template(self) -> None:
         data = self.window_combo.currentData()
@@ -516,72 +619,6 @@ class MainWindow(QtWidgets.QWidget):
         self.layout_estimator.hand_bbox = rect
         self.status_label.setText("状态：已校准手牌区域")
 
-    def process_frame(self) -> None:
-        if self.current_window is None:
-            return
-        try:
-            image = self.capture.capture(self.current_window)
-            if image is None:
-                return
-            state = self.extractor.extract(image)
-            
-            # Debug Drawing
-            debug_img = image.copy()
-            layout_dict = state.get("layout")
-            if layout_dict:
-                # Draw hand regions
-                hand_regions = layout_dict.get("hand_regions", [])
-                for i, (x, y, w, h) in enumerate(hand_regions):
-                    cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                    # If we have recognition result for this tile, draw it
-                    hand_tiles = state.get("hand", [])
-                    if i < len(hand_tiles):
-                        name = tile_to_name(hand_tiles[i])
-                        cv2.putText(debug_img, name, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-
-                
-                # Draw discard regions (optional, can clutter)
-                # for player, regions in layout.discard_regions.items():
-                #    for x, y, w, h in regions:
-                #        cv2.rectangle(debug_img, (x, y), (x + w, y + h), (255, 0, 0), 1)
-
-            preview = cv2.cvtColor(debug_img, cv2.COLOR_BGR2RGB)
-            preview = np.ascontiguousarray(preview)
-            height, width = preview.shape[:2]
-            bytes_per_line = preview.strides[0]
-            qimg = QtGui.QImage(
-                preview.data,
-                width,
-                height,
-                bytes_per_line,
-                QtGui.QImage.Format.Format_RGB888,
-            ).copy()
-            pix = QtGui.QPixmap.fromImage(qimg)
-            target_size = self.preview_label.size()
-            if target_size.width() > 0 and target_size.height() > 0:
-                pix = pix.scaled(
-                    target_size,
-                    QtCore.Qt.AspectRatioMode.KeepAspectRatio,
-                    QtCore.Qt.TransformationMode.SmoothTransformation,
-                )
-            self.preview_label.setPixmap(pix)
-            
-            result = self.backend_client.predict(state)
-            recommendations = result.get("recommendations", [])
-            warning = result.get("warning", "")
-            action = result.get("action_advice", {})
-            discards = result.get("discard_suggestions", [])
-            if warning:
-                self.status_label.setText(f"状态：{warning}")
-            else:
-                self.status_label.setText("状态：识别中")
-            self._render_state(state)
-            self._render_action(action, discards)
-            self._render_recommendations(recommendations, warning)
-        except Exception as exc:
-            self.timer.stop()
-            self.status_label.setText(f"状态：识别异常 {exc}")
-            self.logger.exception("Process frame failed: %s", exc)
 
     def _render_state(self, state: Dict) -> None:
         hand = state.get("hand", [])
@@ -591,14 +628,19 @@ class MainWindow(QtWidgets.QWidget):
             self.hand_label.setText("未识别" + (debug if self.debug_check.isChecked() else ""))
         else:
             self.hand_label.setText(hand_text)
+            
+        # Update discard labels
         discards = state.get("discarded_tiles", [])
+        
         grouped = {i: [] for i in range(4)}
         for d in discards:
             grouped[d["player"]].append(tile_to_name(d["tile"]))
-        lines = []
-        for player in range(4):
-            tiles = " ".join(grouped[player]) if grouped[player] else "-"
-            lines.append(f"P{player}: {tiles}")
+            
+        for pid in [1, 2, 3]:
+            if pid in self.discard_labels:
+                tiles = grouped.get(pid, [])
+                text = " ".join(tiles) if tiles else "无"
+                self.discard_labels[pid].setText(text)
         current_discard = state.get("current_discard")
         if current_discard is not None:
             lines.append(f"当前出牌: {tile_to_name(current_discard)}")

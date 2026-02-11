@@ -50,6 +50,21 @@ class TileRecognizer:
             self.template_count += 1
         self.logger.info("Loaded templates: %s/%s from %s", self.template_count, self.template_total, self.templates_dir)
 
+    def recognize_roi(self, roi: np.ndarray) -> int:
+        if roi.size == 0 or not self.templates:
+            return -1
+        
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        if self.equalize_hist:
+            gray = cv2.equalizeHist(gray)
+            
+        roi_edge = cv2.Canny(gray, 50, 150)
+        tile_id, score = self._match_best(gray, roi_edge)
+        
+        if score < self.last_threshold:
+            return -1
+        return tile_id
+
     def recognize_regions(self, image: np.ndarray, regions: List[Tuple[int, int, int, int]]) -> List[int]:
         results: List[int] = []
         if not self.templates:
