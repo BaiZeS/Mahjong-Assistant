@@ -641,7 +641,9 @@ class MainWindow(QtWidgets.QWidget):
                 tiles = grouped.get(pid, [])
                 text = " ".join(tiles) if tiles else "无"
                 self.discard_labels[pid].setText(text)
+        
         current_discard = state.get("current_discard")
+        lines = []
         if current_discard is not None:
             lines.append(f"当前出牌: {tile_to_name(current_discard)}")
         self.discard_label.setText(" | ".join(lines))
